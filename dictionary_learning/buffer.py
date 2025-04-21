@@ -51,7 +51,7 @@ class ActivationBuffer:
         self.io = io
         self.n_ctxs = n_ctxs
         self.ctx_len = ctx_len
-        self.activation_buffer_size = n_ctxs * ctx_len
+        self.activation_buffer_size = int(n_ctxs * ctx_len)
         self.refresh_batch_size = refresh_batch_size
         self.out_batch_size = out_batch_size
         self.device = device

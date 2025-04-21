@@ -422,3 +422,247 @@ class AutoEncoderNew(Dictionary, nn.Module):
         if device is not None:
             autoencoder.to(device)
         return autoencoder
+
+
+class RelaxedArchetypalAutoEncoder(Dictionary, nn.Module):
+    """
+    Autoencoder implementing the Relaxed Archetypal Dictionary for SAE (RA-SAE).
+
+    Constructs a dictionary where each atom is a convex combination of data
+    points from an estimated hull, with a small relaxation term constrained by delta.
+
+    For more details, see the paper:
+    "Archetypal SAE: Adaptive and Stable Dictionary Learning for Concept Extraction
+    in Large Vision Models" by Fel et al. (2025), https://arxiv.org/abs/2502.12892
+
+    Parameters
+    ----------
+    activation_dim : int
+        Dimensionality of the input data (e.g number of channels).
+    dict_size : int
+        Number of components/concepts in the dictionary. The dictionary is overcomplete if
+        the number of concepts > activation_dim.
+    num_candidates : int
+        Number of candidate points to use for the convex hull estimation.
+    delta : float, optional
+        Constraint on the relaxation term, by default 1.0.
+    use_multiplier : bool, optional
+        Whether to train a positive scalar to multiply the dictionary after convex combination,
+        by default True.
+    """
+
+    def __init__(
+        self, 
+        activation_dim, 
+        dict_size, 
+        num_candidates=100, 
+        delta=1.0, 
+        use_multiplier=True,
+        device="cpu"
+    ):
+        super().__init__()
+        self.activation_dim = activation_dim
+        self.dict_size = dict_size
+        self.delta = delta
+        self.num_candidates = num_candidates
+        
+        # Initialize candidate points randomly - will be updated during training
+        self.register_buffer("C", t.randn(num_candidates, activation_dim, device=device))
+        
+        # Initialize encoder and decoder
+        self.encoder = nn.Linear(activation_dim, dict_size, bias=True)
+        self.decoder = nn.Linear(dict_size, activation_dim, bias=False)  # No bias for decoder
+        
+        # Initialize weights - adapted from AutoEncoderNew
+        w = t.randn(activation_dim, dict_size, device=device)
+        w = w / w.norm(dim=0, keepdim=True) * 0.1
+        
+        # Set encoder and decoder weights
+        self.encoder.weight = nn.Parameter(w.clone().T)
+        self.decoder.weight = nn.Parameter(w.clone())
+        
+        # Initialize encoder bias to zeros
+        init.zeros_(self.encoder.bias)
+        
+        # Use a weight matrix for convex combinations of candidates
+        self.combination_weights = nn.Parameter(t.zeros(dict_size, num_candidates, device=device))
+        
+        # Initialize combination weights to be row-stochastic
+        with t.no_grad():
+            nn.init.kaiming_uniform_(self.combination_weights)
+            self.combination_weights.data = nn.functional.softmax(self.combination_weights, dim=-1)
+        
+        # Relaxation term
+        self.Relax = nn.Parameter(t.zeros(dict_size, activation_dim, device=device))
+        
+        # Multiplier for scaling the dictionary
+        if use_multiplier:
+            self.multiplier = nn.Parameter(t.tensor(0.0, device=device))
+        else:
+            self.register_buffer("multiplier", t.tensor(0.0, device=device))
+        
+        # Dictionary cache
+        self._dictionary_cache = None
+        
+        # Update candidate points with a running estimation
+        self.register_buffer("C_update_counter", t.tensor(0, device=device))
+
+    def encode(self, x):
+        """
+        Encode the input to sparse features.
+        
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input tensor of shape (batch_size, activation_dim).
+            
+        Returns
+        -------
+        torch.Tensor
+            Sparse features of shape (batch_size, dict_size).
+        """
+        return nn.functional.relu(self.encoder(x))
+    
+    def decode(self, f):
+        """
+        Decode the sparse features back to input space.
+        
+        Parameters
+        ----------
+        f : torch.Tensor
+            Sparse features of shape (batch_size, dict_size).
+            
+        Returns
+        -------
+        torch.Tensor
+            Decoded tensor of shape (batch_size, activation_dim).
+        """
+        # Apply decoder transformation
+        return self.decoder(f)
+    
+    def forward(self, x, output_features=False):
+        """
+        Forward pass of the autoencoder.
+        
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input tensor of shape (batch_size, activation_dim).
+        output_features : bool, optional
+            Whether to output the sparse features alongside reconstructions, by default False.
+            
+        Returns
+        -------
+        torch.Tensor or tuple
+            Reconstructed tensor of shape (batch_size, activation_dim) if output_features is False,
+            otherwise a tuple (reconstruction, features).
+        """
+        f = self.encode(x)
+        x_hat = self.decode(f)
+        
+        if not output_features:
+            return x_hat
+        else:
+            # Scale features by decoder column norms for better interpretability
+            atom_norms = self.decoder.weight.norm(dim=0, keepdim=True).T.squeeze()
+            f_scaled = f * atom_norms
+            return x_hat, f_scaled
+    
+    def _update_dictionary(self):
+        """
+        Update the decoder weights based on the archetypal dictionary formulation.
+        This constrains the dictionary to be a convex combination of candidate points
+        plus a relaxation term.
+        """
+        # Ensure combination_weights remains row-stochastic (positive and row sum to one)
+        with t.no_grad():
+            W = t.relu(self.combination_weights)
+            W = W / (W.sum(dim=-1, keepdim=True) + 1e-8)
+            self.combination_weights.data = W
+
+            # Enforce the norm constraint on Relax to limit deviation from conv(C)
+            norm_Lambda = self.Relax.norm(dim=-1, keepdim=True)  # norm per row
+            scaling_factor = t.clamp(self.delta / norm_Lambda, max=1.0)  # safe scaling factor
+            self.Relax.data = self.Relax * scaling_factor  # scale Lambda to satisfy ||Lambda|| < delta
+
+        # Compute the dictionary as a convex combination plus relaxation
+        D = t.matmul(self.combination_weights, self.C) + self.Relax
+        D = D * t.exp(self.multiplier)
+        
+        # Update the decoder weights directly
+        self.decoder.weight.data = D.T
+        
+        # Cache the updated dictionary
+        self._dictionary_cache = D
+
+    def update_candidates(self, batch):
+        """
+        Update the candidate points using the current batch.
+        
+        Parameters
+        ----------
+        batch : torch.Tensor
+            Batch of points to use for updating the candidates.
+        """
+        with t.no_grad():
+            # Simple running average update of candidate points
+            batch_size = batch.shape[0]
+            if batch_size > 0:
+                # Select a subset of points if batch is larger than num_candidates
+                if batch_size > self.num_candidates:
+                    indices = t.randperm(batch_size)[:self.num_candidates]
+                    batch = batch[indices]
+                
+                # Update counter
+                self.C_update_counter += 1
+                
+                # Update C with running average
+                alpha = 1.0 / self.C_update_counter
+                self.C.data = (1 - alpha) * self.C + alpha * batch[:self.num_candidates]
+                
+                # Update dictionary since C has changed
+                self._update_dictionary()
+    
+    def apply_archetypal_constraints(self):
+        """
+        Apply the archetypal constraints to the decoder weights.
+        This should be called after each optimization step during training.
+        """
+        self._update_dictionary()
+    
+    @classmethod
+    def from_pretrained(cls, path, device=None):
+        """
+        Load a pretrained autoencoder from a file.
+        
+        Parameters
+        ----------
+        path : str
+            Path to the saved model.
+        device : str, optional
+            Device to load the model on, by default None.
+            
+        Returns
+        -------
+        RelaxedArchetypalAutoEncoder
+            Loaded model.
+        """
+        state_dict = t.load(path)
+        
+        # Extract parameters from state dict
+        C = state_dict.get("C")
+        num_candidates = C.shape[0]
+        activation_dim = C.shape[1]
+        dict_size = state_dict.get("combination_weights").shape[0]
+        
+        # Create model
+        model = cls(activation_dim, dict_size, num_candidates)
+        model.load_state_dict(state_dict)
+        
+        # Update dictionary immediately
+        model._update_dictionary()
+        
+        if device is not None:
+            model.to(device)
+        
+        return model
